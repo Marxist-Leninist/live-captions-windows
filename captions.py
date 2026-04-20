@@ -15,6 +15,7 @@ Usage:
   python captions.py --model small.en
 """
 import argparse
+import collections
 import os
 import queue
 import sys
@@ -39,11 +40,15 @@ import tkinter as tk
 
 TARGET_SR = 16000
 CHUNK_MS = 30
-VAD_SILENCE_MS = 500
-MAX_BUFFER_S = 4.0          # shorter = lower latency; small/medium models need this
-MIN_SPEAK_S = 0.4
-RMS_THRESHOLD = 0.006  # float32 RMS (normalized)
-MAX_QUEUE_BACKLOG = 1       # drop older segments if transcribe can't keep up
+VAD_SILENCE_MS = 180
+MAX_BUFFER_S = 1.0          # 1s cap — captions appear within ~1s of speech
+MIN_SPEAK_S = 0.15
+RMS_THRESHOLD = 0.006
+MAX_QUEUE_BACKLOG = 0       # never keep backlog — only transcribe newest segment
+# Streaming mode: emit rolling window every N seconds regardless of silence.
+# Gives "live" captions that update mid-sentence.
+STREAM_EMIT_EVERY_S = 0.6
+STREAM_WINDOW_S = 1.6
 
 
 def resample_mono(raw_int16: np.ndarray, src_sr: int, src_channels: int) -> np.ndarray:
@@ -168,6 +173,51 @@ class MixerThread(threading.Thread):
             self.out_q.put(mix.astype(np.float32))
 
 
+class StreamingThread(threading.Thread):
+    """Rolling-window streamer: every STREAM_EMIT_EVERY_S, if there's speech in the
+    last STREAM_WINDOW_S of audio, push that window to transcribe. Produces live
+    mid-sentence captions instead of waiting for silence."""
+    daemon = True
+
+    def __init__(self, in_q: queue.Queue, out_q: queue.Queue):
+        super().__init__()
+        self.in_q = in_q
+        self.out_q = out_q
+        self.running = True
+
+    def run(self):
+        window_samples = int(TARGET_SR * STREAM_WINDOW_S)
+        buf = collections.deque()
+        buf_samples = 0
+        last_emit = time.time()
+        emit_every = STREAM_EMIT_EVERY_S
+        min_samples = int(TARGET_SR * MIN_SPEAK_S)
+        while self.running:
+            try:
+                chunk = self.in_q.get(timeout=0.1)
+                buf.append(chunk)
+                buf_samples += len(chunk)
+                # trim from the front so buffer stays around STREAM_WINDOW_S
+                while buf_samples > window_samples + len(chunk):
+                    old = buf.popleft()
+                    buf_samples -= len(old)
+            except queue.Empty:
+                pass
+            now = time.time()
+            if now - last_emit >= emit_every and buf_samples >= min_samples:
+                audio = np.concatenate(list(buf))
+                rms = float(np.sqrt(np.mean(audio * audio))) if audio.size else 0.0
+                if rms > RMS_THRESHOLD * 0.7:
+                    # drop any backlog first so we only ever work on freshest
+                    try:
+                        while self.out_q.qsize() > 0:
+                            self.out_q.get_nowait()
+                    except queue.Empty:
+                        pass
+                    self.out_q.put(audio)
+                last_emit = now
+
+
 class VADThread(threading.Thread):
     """Accumulate audio; emit a segment when silence > VAD_SILENCE_MS after speech,
     or when buffer reaches MAX_BUFFER_S."""
@@ -241,6 +291,52 @@ class VADThread(threading.Thread):
 class TranscribeThread(threading.Thread):
     daemon = True
 
+    def _ensure_model_downloaded(self, repo_id: str):
+        """Pre-download with live progress bar in the overlay."""
+        try:
+            from huggingface_hub import snapshot_download
+            from tqdm.auto import tqdm as _tqdm_base
+        except Exception:
+            return
+        cb = self.cb
+        model_short = repo_id.rsplit("/", 1)[-1]
+
+        class UITqdm(_tqdm_base):
+            _last_emit = 0.0
+            def update(self, n=1):
+                super().update(n)
+                try:
+                    now = time.time()
+                    if now - UITqdm._last_emit < 0.4:
+                        return
+                    UITqdm._last_emit = now
+                    total = self.total or 0
+                    done = self.n or 0
+                    if total <= 0 or done >= total:
+                        return
+                    pct = done * 100.0 / total
+                    rate = self.format_dict.get("rate") or 0
+                    if rate > 0:
+                        sec = max(0, (total - done) / rate)
+                        eta = f"{int(sec)}s" if sec < 60 else f"{int(sec / 60)}m{int(sec) % 60}s"
+                        mb_s = rate / (1024 * 1024)
+                        cb(f"Downloading {model_short}... {pct:.0f}%  {done/1e6:.0f}/{total/1e6:.0f} MB  ETA {eta}  ({mb_s:.1f} MB/s)")
+                    else:
+                        cb(f"Downloading {model_short}... {pct:.0f}%  {done/1e6:.0f}/{total/1e6:.0f} MB")
+                except Exception:
+                    pass
+
+        try:
+            cb(f"Checking {model_short} in cache...")
+            snapshot_download(
+                repo_id=repo_id,
+                allow_patterns=["model.bin", "config.json", "tokenizer.json", "vocabulary.*", "preprocessor_config.json"],
+                tqdm_class=UITqdm,
+            )
+            cb(f"{model_short} ready — loading into GPU...")
+        except Exception as e:
+            cb(f"Model download error: {e}")
+
     def __init__(self, in_q: queue.Queue, ui_cb, model_name: str, force_cpu: bool, compute_type: str | None = None):
         super().__init__()
         self.in_q = in_q
@@ -251,15 +347,24 @@ class TranscribeThread(threading.Thread):
         self.compute_type = compute_type
 
     def run(self):
-        # GTX 1050 Ti / other Pascal cards lack efficient fp16 in CTranslate2.
-        # int8   — fastest on Pascal (pure 8-bit, ~30% quicker than int8_float32)
-        # int8_float32 — quantized weights + fp32 accumulation (slightly higher quality)
-        if self.compute_type:
-            devices = [("cuda", self.compute_type)] if not self.force_cpu else [("cpu", self.compute_type)]
-        elif self.force_cpu:
-            devices = [("cpu", "int8")]
+        # GPU-ONLY policy: never fall back to CPU. Pascal cards (GTX 1050 Ti, etc.)
+        # lack efficient fp16, so compute types stay in int8 / int8_float32 on CUDA.
+        # --cpu flag still forces CPU if explicitly set (you asked; you got it).
+        if self.force_cpu:
+            devices = [("cpu", self.compute_type or "int8")]
+        elif self.compute_type:
+            devices = [("cuda", self.compute_type)]
         else:
-            devices = [("cuda", "int8"), ("cuda", "int8_float32"), ("cpu", "int8")]
+            devices = [("cuda", "int8"), ("cuda", "int8_float32")]
+
+        # Pre-download model with live progress to the overlay. faster-whisper would
+        # download silently inside WhisperModel(); we hook HF snapshot_download with
+        # a tqdm subclass that pipes pct + ETA to the UI callback.
+        repo_id = self.model_name
+        if "/" not in repo_id:
+            # short names like "small.en" map to Systran/faster-whisper-small.en
+            repo_id = f"Systran/faster-whisper-{repo_id}"
+        self._ensure_model_downloaded(repo_id)
         model = None
         last_err = None
         for dev, ct in devices:
@@ -300,27 +405,49 @@ class TranscribeThread(threading.Thread):
                     audio,
                     language="en",
                     beam_size=1,
+                    best_of=1,
                     vad_filter=False,
                     condition_on_previous_text=False,
+                    without_timestamps=True,
+                    no_speech_threshold=0.6,
+                    # skip sanity filters that cost extra decoder passes
+                    log_prob_threshold=None,
+                    compression_ratio_threshold=None,
                 )
                 text = " ".join(s.text.strip() for s in segments).strip()
             except Exception as e:
+                err_str = str(e).lower()
                 print(f"[transcribe err] {e}\n{traceback.format_exc()}")
-                self.cb(f"[transcribe err: {e}]")
-                # Try to reload model rather than die silently.
-                try:
-                    del model
-                    model = WhisperModel(self.model_name, device="cpu", compute_type="int8")
-                    print("[transcribe] reloaded on cpu/int8 after error")
-                except Exception as e2:
-                    print(f"[transcribe] reload failed: {e2}")
+                is_oom = "out of memory" in err_str or "oom" in err_str
+                # GPU-only recovery: release CUDA state then retry on CUDA. Never fall to CPU.
+                if is_oom or "cuda" in err_str:
+                    self.cb(f"[CUDA err: retrying on GPU…]")
+                    try:
+                        import gc
+                        del model
+                        model = None
+                        gc.collect()
+                        # small pause so driver can release the VRAM
+                        time.sleep(2.0)
+                        dev, ct = (devices[0] if devices else ("cuda", "int8"))
+                        if dev != "cuda":
+                            dev, ct = "cuda", (self.compute_type or "int8")
+                        model = WhisperModel(self.model_name, device=dev, compute_type=ct)
+                        self.cb(f"Recovered on {dev}/{ct}.")
+                    except Exception as e2:
+                        print(f"[transcribe] GPU reload failed: {e2}")
+                        self.cb(f"GPU reload failed: {e2}. Kill other CUDA apps and relaunch.")
+                else:
+                    self.cb(f"[transcribe err: {e}]")
                 continue
             if text:
                 self.cb(text, finalize=True)
 
 
 class CaptionUI:
-    def __init__(self, alpha: float = 0.55, transparent_bg: bool = False):
+    def __init__(self, alpha: float = 0.55, transparent_bg: bool = False,
+                 font_size: int = 42, color: str = "#FFFFFF",
+                 position: str = "bottom"):
         self.root = tk.Tk()
         self.root.title("Live Captions")
         self.root.overrideredirect(True)
@@ -340,22 +467,26 @@ class CaptionUI:
                 pass
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
-        w, h = int(sw * 0.7), 130
+        # Width scales with font; height fits 3 lines (2 captions, 2nd may wrap) + padding.
+        w = int(sw * 0.9)
+        line_h = int(font_size * 1.3)
+        h = line_h * 3 + 40
         x = (sw - w) // 2
-        y = 20
+        y = 20 if position == "top" else sh - h - 80
         self.root.geometry(f"{w}x{h}+{x}+{y}")
         self._reassert_topmost()
 
-        self.label = tk.Label(
-            self.root,
-            text="Starting...",
-            font=("Segoe UI", 18, "bold"),
-            fg="#FFFFFF",
-            bg="#000000",
-            wraplength=w - 20,
-            justify="center",
-        )
-        self.label.pack(expand=True, fill="both", padx=10, pady=10)
+        self.font_size = font_size
+        self.color = color
+        self._canvas_w = w
+        self._canvas_h = h
+        self.canvas = tk.Canvas(self.root, bg="#000000", highlightthickness=0, width=w, height=h)
+        self.canvas.pack(expand=True, fill="both", padx=0, pady=0)
+        # Keep .label for legacy callers (drag/bind still point at it)
+        self.label = self.canvas
+        self._render_text("Starting...")
+        self._last_render_time = 0.0
+        self._pending_text = None
 
         self.root.bind("<Escape>", lambda _e: self.shutdown())
         self.root.bind_all("<F9>", lambda _e: self.toggle())
@@ -375,6 +506,28 @@ class CaptionUI:
 
     def _drag(self, e):
         self.root.geometry(f"+{e.x_root - self._dx}+{e.y_root - self._dy}")
+
+    def _render_text(self, text: str):
+        """Canvas-draw text with a black stroke so it stays legible on any bg."""
+        c = self.canvas
+        c.delete("all")
+        w = self._canvas_w
+        h = self._canvas_h
+        font = ("Segoe UI", self.font_size, "bold")
+        x = w // 2
+        y = h // 2
+        wrap = max(100, w - 30)
+        # 8-direction stroke (black outline) — cheap text-stroke emulation for tkinter
+        stroke = max(1, self.font_size // 20)
+        for dx in (-stroke, 0, stroke):
+            for dy in (-stroke, 0, stroke):
+                if dx == 0 and dy == 0:
+                    continue
+                c.create_text(x + dx, y + dy, text=text, font=font,
+                              fill="#000000", width=wrap, anchor="center", justify="center")
+        # main fill on top
+        c.create_text(x, y, text=text, font=font, fill=self.color,
+                      width=wrap, anchor="center", justify="center")
 
     def _reassert_topmost(self):
         try:
@@ -396,10 +549,14 @@ class CaptionUI:
         def apply():
             if finalize:
                 self.history.append(text)
-                combined = " ".join(self.history)
+                # Flow-join — tkinter canvas wraps to next line when wraplength is hit.
+                # Fills horizontal space; wraps naturally to 2 lines for longer text.
+                combined = "  ".join(self.history)
             else:
-                combined = text
-            self.label.config(text=combined)
+                prev = list(self.history)[-1] if self.history else ""
+                combined = (prev + "  " + text) if prev else text
+            self._render_text(combined)
+            self._last_render_time = time.time()
         self.root.after(0, apply)
 
     def shutdown(self):
@@ -430,12 +587,21 @@ def main():
                     help="overlay opacity 0.0 (invisible) to 1.0 (opaque). Default 0.55")
     ap.add_argument("--transparent-bg", action="store_true",
                     help="make the overlay background fully transparent (text floats, no backdrop)")
+    ap.add_argument("--font-size", type=int, default=42,
+                    help="caption font size in pt (default 42, YouTube-ish large)")
+    ap.add_argument("--color", default="#FFFFFF",
+                    help="caption color: hex (#FFFFFF) or name (white, yellow, lime, cyan)")
+    ap.add_argument("--position", choices=["top", "bottom"], default="bottom",
+                    help="overlay position (default bottom, YouTube-style)")
+    ap.add_argument("--streaming", action="store_true",
+                    help="rolling-window live mode: emit captions every 0.6s with updates mid-sentence")
     args = ap.parse_args()
 
     audio_q: queue.Queue = queue.Queue()
     segment_q: queue.Queue = queue.Queue()
 
-    ui = CaptionUI(alpha=args.alpha, transparent_bg=args.transparent_bg)
+    ui = CaptionUI(alpha=args.alpha, transparent_bg=args.transparent_bg,
+                   font_size=args.font_size, color=args.color, position=args.position)
 
     captures: list[CaptureThread] = []
     mixer: MixerThread | None = None
@@ -448,6 +614,9 @@ def main():
     else:
         captures.append(CaptureThread(audio_q, source=args.source))
     capture = captures[0]  # for err reporting below
+
+    # Streaming mode replaces the VAD silence-flush with a rolling window emitter.
+    use_streaming = args.streaming
     vad = VADThread(audio_q, segment_q)
     transcribe = TranscribeThread(segment_q, ui.set_text, args.model, args.cpu, args.compute_type)
 
@@ -460,6 +629,10 @@ def main():
         transcribe.running = False
 
     ui.shutdown_cb = stop
+
+    # Swap VAD for streaming if requested.
+    if use_streaming:
+        vad = StreamingThread(audio_q, segment_q)
 
     for c in captures:
         c.start()
