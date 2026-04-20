@@ -15,11 +15,22 @@ Usage:
   python captions.py --model small.en
 """
 import argparse
+import os
 import queue
 import sys
 import threading
 import time
+import traceback
 from collections import deque
+
+# Early stderr/stdout capture so pythonw crashes land in captions.log.
+try:
+    _logfh = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "captions.log"), "a", buffering=1)
+    sys.stderr = _logfh
+    sys.stdout = _logfh
+    print(f"\n=== captions.py started at {time.strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()} ===")
+except Exception:
+    pass
 
 import numpy as np
 import pyaudiowpatch as pyaudio
@@ -28,10 +39,11 @@ import tkinter as tk
 
 TARGET_SR = 16000
 CHUNK_MS = 30
-VAD_SILENCE_MS = 700
-MAX_BUFFER_S = 8.0
+VAD_SILENCE_MS = 500
+MAX_BUFFER_S = 4.0          # shorter = lower latency; small/medium models need this
 MIN_SPEAK_S = 0.4
 RMS_THRESHOLD = 0.006  # float32 RMS (normalized)
+MAX_QUEUE_BACKLOG = 1       # drop older segments if transcribe can't keep up
 
 
 def resample_mono(raw_int16: np.ndarray, src_sr: int, src_channels: int) -> np.ndarray:
@@ -175,13 +187,27 @@ class VADThread(threading.Thread):
         silence_limit = int(TARGET_SR * VAD_SILENCE_MS / 1000)
         max_samples = int(TARGET_SR * MAX_BUFFER_S)
         min_speech = int(TARGET_SR * MIN_SPEAK_S)
+        last_chunk_time = time.time()
 
         while self.running:
             try:
                 chunk = self.in_q.get(timeout=0.5)
+                last_chunk_time = time.time()
             except queue.Empty:
+                # Watchdog: if we have buffered speech and capture has stalled for >2s,
+                # flush what we have instead of letting the overlay freeze on stale text.
+                if speech_samples >= min_speech and time.time() - last_chunk_time > 2.0:
+                    try:
+                        self.out_q.put(np.concatenate(buf))
+                    except Exception:
+                        pass
+                    buf = []
+                    buf_samples = silent_samples = speech_samples = 0
                 continue
-            rms = float(np.sqrt(np.mean(chunk * chunk))) if chunk.size else 0.0
+            try:
+                rms = float(np.sqrt(np.mean(chunk * chunk))) if chunk.size else 0.0
+            except Exception:
+                rms = 0.0
             is_speech = rms > RMS_THRESHOLD
             buf.append(chunk)
             buf_samples += len(chunk)
@@ -203,8 +229,11 @@ class VADThread(threading.Thread):
                 continue
 
             if flush:
-                audio = np.concatenate(buf)
-                self.out_q.put(audio)
+                try:
+                    audio = np.concatenate(buf)
+                    self.out_q.put(audio)
+                except Exception as _e:
+                    print(f"[VAD flush err] {_e}")
                 buf = []
                 buf_samples = silent_samples = speech_samples = 0
 
@@ -212,19 +241,25 @@ class VADThread(threading.Thread):
 class TranscribeThread(threading.Thread):
     daemon = True
 
-    def __init__(self, in_q: queue.Queue, ui_cb, model_name: str, force_cpu: bool):
+    def __init__(self, in_q: queue.Queue, ui_cb, model_name: str, force_cpu: bool, compute_type: str | None = None):
         super().__init__()
         self.in_q = in_q
         self.cb = ui_cb
         self.running = True
         self.model_name = model_name
         self.force_cpu = force_cpu
+        self.compute_type = compute_type
 
     def run(self):
-        # GTX 1050 Ti / other Pascal cards lack efficient fp16 in CTranslate2;
-        # int8_float32 gives quantized weights with fp32 accumulation (fast + supported).
-        devices = [("cuda", "int8_float32"), ("cuda", "int8")] if not self.force_cpu else []
-        devices.append(("cpu", "int8"))
+        # GTX 1050 Ti / other Pascal cards lack efficient fp16 in CTranslate2.
+        # int8   — fastest on Pascal (pure 8-bit, ~30% quicker than int8_float32)
+        # int8_float32 — quantized weights + fp32 accumulation (slightly higher quality)
+        if self.compute_type:
+            devices = [("cuda", self.compute_type)] if not self.force_cpu else [("cpu", self.compute_type)]
+        elif self.force_cpu:
+            devices = [("cpu", "int8")]
+        else:
+            devices = [("cuda", "int8"), ("cuda", "int8_float32"), ("cpu", "int8")]
         model = None
         last_err = None
         for dev, ct in devices:
@@ -246,6 +281,20 @@ class TranscribeThread(threading.Thread):
                 audio = self.in_q.get(timeout=0.5)
             except queue.Empty:
                 continue
+            if audio is None or len(audio) < 1600:
+                continue
+            # Drop backlog: if more segments are already waiting, skip stale ones
+            # and only transcribe the newest. Prevents captions falling seconds
+            # behind live audio when the model is slower than realtime.
+            dropped = 0
+            while self.in_q.qsize() > MAX_QUEUE_BACKLOG:
+                try:
+                    audio = self.in_q.get_nowait()
+                    dropped += 1
+                except queue.Empty:
+                    break
+            if dropped:
+                print(f"[transcribe] dropped {dropped} stale segments to catch up")
             try:
                 segments, _info = model.transcribe(
                     audio,
@@ -256,7 +305,15 @@ class TranscribeThread(threading.Thread):
                 )
                 text = " ".join(s.text.strip() for s in segments).strip()
             except Exception as e:
+                print(f"[transcribe err] {e}\n{traceback.format_exc()}")
                 self.cb(f"[transcribe err: {e}]")
+                # Try to reload model rather than die silently.
+                try:
+                    del model
+                    model = WhisperModel(self.model_name, device="cpu", compute_type="int8")
+                    print("[transcribe] reloaded on cpu/int8 after error")
+                except Exception as e2:
+                    print(f"[transcribe] reload failed: {e2}")
                 continue
             if text:
                 self.cb(text, finalize=True)
@@ -358,8 +415,15 @@ class CaptionUI:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="base.en", help="faster-whisper model (tiny.en, base.en, small.en, medium.en)")
+    ap.add_argument("--model", default="base.en",
+                    help="faster-whisper model. Base: tiny.en, base.en, small.en, medium.en. "
+                         "Distilled (2x faster): Systran/faster-distil-whisper-small.en, "
+                         "Systran/faster-distil-whisper-medium.en-v2")
     ap.add_argument("--cpu", action="store_true", help="force CPU")
+    ap.add_argument("--compute-type", default=None,
+                    help="ctranslate2 compute type. Default auto (int8 on GPU, int8 on CPU). "
+                         "Options: int8 (fastest), int8_float32 (more stable), float32 (reference). "
+                         "Pascal GPUs cannot use float16/bfloat16.")
     ap.add_argument("--source", choices=["system", "mic", "both"], default="system",
                     help="'system' = WASAPI loopback; 'mic' = default input; 'both' = mix of system+mic")
     ap.add_argument("--alpha", type=float, default=0.55,
@@ -385,7 +449,7 @@ def main():
         captures.append(CaptureThread(audio_q, source=args.source))
     capture = captures[0]  # for err reporting below
     vad = VADThread(audio_q, segment_q)
-    transcribe = TranscribeThread(segment_q, ui.set_text, args.model, args.cpu)
+    transcribe = TranscribeThread(segment_q, ui.set_text, args.model, args.cpu, args.compute_type)
 
     def stop():
         for c in captures:
@@ -403,6 +467,32 @@ def main():
         mixer.start()
     vad.start()
     transcribe.start()
+
+    # Supervisor: if any worker dies, respawn it so the overlay never goes stale.
+    def supervisor():
+        nonlocal vad, transcribe
+        while any(c.running for c in captures) or vad.running or transcribe.running:
+            time.sleep(2.0)
+            for i, c in enumerate(list(captures)):
+                if c.running and not c.is_alive():
+                    print(f"[supervisor] capture[{i}] ({c.source}) died, respawning")
+                    target_q = audio_q if args.source != "both" else (q_sys if c.source == "system" else q_mic)
+                    nc = CaptureThread(target_q, source=c.source)
+                    captures[i] = nc
+                    nc.start()
+            if vad.running and not vad.is_alive():
+                print("[supervisor] VAD died, respawning")
+                seg_q = segment_q
+                new_vad = VADThread(audio_q, seg_q)
+                new_vad.start()
+                vad = new_vad
+            if transcribe.running and not transcribe.is_alive():
+                print("[supervisor] transcribe died, respawning")
+                new_t = TranscribeThread(segment_q, ui.set_text, args.model, args.cpu, args.compute_type)
+                new_t.start()
+                transcribe = new_t
+    sup_thread = threading.Thread(target=supervisor, daemon=True)
+    sup_thread.start()
 
     time.sleep(0.3)
     errs = [c.err for c in captures if c.err]

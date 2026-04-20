@@ -29,5 +29,12 @@ NOTES
 MODELS (English-only variants are fastest)
   tiny.en    ~40MB   fast, ok accuracy
   base.en    ~140MB  [default] best speed/accuracy tradeoff
-  small.en   ~460MB  notably better, still realtime on 1050 Ti
-  medium.en  ~1.5GB  great, slower, may lag on long bursts
+  small.en   ~460MB  notably better, still realtime on 1050 Ti  [captions-small.bat]
+  medium.en  ~1.5GB  best that fits 4GB VRAM int8               [captions-medium.bat]
+  large-v3   ~3GB    NOT recommended on 1050 Ti (4GB VRAM tight, risk OOM)
+
+SWITCHING MODEL
+  - Easiest: use a different .bat launcher (captions-small.bat etc.)
+  - Or:  python captions.py --model medium.en
+  - Only one instance at a time; kill previous before launching new.
+  - First run of a new model downloads weights to %USERPROFILE%\.cache\huggingface.
