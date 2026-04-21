@@ -18,6 +18,7 @@ import argparse
 import collections
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -40,15 +41,57 @@ import tkinter as tk
 
 TARGET_SR = 16000
 CHUNK_MS = 30
-VAD_SILENCE_MS = 180
-MAX_BUFFER_S = 1.0          # 1s cap — captions appear within ~1s of speech
-MIN_SPEAK_S = 0.15
+VAD_SILENCE_MS = 350        # let phrases finish naturally
+MAX_BUFFER_S = 3.0          # bigger chunks = more context = much better accuracy on large models
+MIN_SPEAK_S = 0.3
 RMS_THRESHOLD = 0.006
 MAX_QUEUE_BACKLOG = 0       # never keep backlog — only transcribe newest segment
 # Streaming mode: emit rolling window every N seconds regardless of silence.
 # Gives "live" captions that update mid-sentence.
 STREAM_EMIT_EVERY_S = 0.6
 STREAM_WINDOW_S = 1.6
+
+
+# Whisper's known hallucinations on silent/ambiguous audio. Case-insensitive match
+# on the stripped transcription — if the entire output is one of these, drop it.
+_HALLUCINATION_PATTERNS = {
+    "thank you.",
+    "thanks for watching.",
+    "thanks for watching!",
+    "thank you for watching.",
+    "thank you for watching!",
+    "please subscribe.",
+    "like and subscribe.",
+    "subtitles by",
+    "subtitles: ",
+    "you",
+    ".",
+    "..",
+    "...",
+    "!",
+    "?",
+    "bye.",
+    "goodbye.",
+    "[music]",
+    "(music)",
+    "♪",
+    "♪♪",
+}
+
+def _is_likely_hallucination(text: str) -> bool:
+    t = text.strip().lower()
+    if not t:
+        return True
+    if t in _HALLUCINATION_PATTERNS:
+        return True
+    # Repeated single phrase ("Thank you. Thank you. Thank you.")
+    parts = [p.strip() for p in t.replace(",", ".").split(".") if p.strip()]
+    if len(parts) >= 3 and len(set(parts)) == 1:
+        return True
+    # All-caps short phrase that's probably a music tag
+    if len(t) < 30 and t.startswith("[") and t.endswith("]"):
+        return True
+    return False
 
 
 def resample_mono(raw_int16: np.ndarray, src_sr: int, src_channels: int) -> np.ndarray:
@@ -288,6 +331,181 @@ class VADThread(threading.Thread):
                 buf_samples = silent_samples = speech_samples = 0
 
 
+class SenseVoiceTranscribeThread(threading.Thread):
+    """Alibaba SenseVoice-Small — non-autoregressive encoder ASR, not Whisper-lineage.
+    Single forward pass per segment instead of token-by-token decode, so much faster.
+    WER ~7.5% English, 234M params, fits 1050 Ti easily in fp32."""
+    daemon = True
+    _TAG_RE = re.compile(r"<\|[^|]*\|>")  # strips SenseVoice language/emo/event markup
+
+    def __init__(self, in_q: queue.Queue, ui_cb, model_name: str = "iic/SenseVoiceSmall"):
+        super().__init__()
+        self.in_q = in_q
+        self.cb = ui_cb
+        self.running = True
+        self.model_name = model_name
+
+    def run(self):
+        try:
+            import warnings
+            warnings.filterwarnings("ignore")
+            import torch
+            from funasr import AutoModel
+        except Exception as e:
+            self.cb(f"SenseVoice import failed: {e}")
+            return
+        if not torch.cuda.is_available():
+            self.cb("CUDA torch not available. Switch to --engine whisper.")
+            return
+
+        self.cb(f"Loading SenseVoice-Small on CUDA (first load ~30s)...")
+        try:
+            model = AutoModel(
+                model=self.model_name,
+                device="cuda:0",
+                disable_update=True,
+                disable_pbar=True,
+            )
+            self.cb("SenseVoice ready. GPU-only.")
+        except Exception as e:
+            print(f"[sensevoice load err] {e}\n{traceback.format_exc()}")
+            self.cb(f"SenseVoice load failed: {e}")
+            return
+
+        while self.running:
+            try:
+                audio = self.in_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if audio is None or len(audio) < 1600:
+                continue
+            dropped = 0
+            while self.in_q.qsize() > MAX_QUEUE_BACKLOG:
+                try:
+                    audio = self.in_q.get_nowait()
+                    dropped += 1
+                except queue.Empty:
+                    break
+            if dropped:
+                print(f"[sensevoice] dropped {dropped} stale segments")
+            try:
+                res = model.generate(
+                    input=audio.astype("float32"),
+                    cache={},
+                    language="en",
+                    use_itn=True,
+                    batch_size_s=60,
+                )
+                text = ""
+                if res and isinstance(res, list):
+                    raw = res[0].get("text", "") if isinstance(res[0], dict) else str(res[0])
+                    text = self._TAG_RE.sub("", raw).strip()
+            except Exception as e:
+                err = str(e).lower()
+                print(f"[sensevoice err] {e}")
+                if "out of memory" in err or "cuda" in err:
+                    try:
+                        import gc, torch
+                        torch.cuda.empty_cache()
+                        gc.collect()
+                    except Exception:
+                        pass
+                self.cb(f"[sensevoice err: {e}]")
+                continue
+            if text and not _is_likely_hallucination(text):
+                self.cb(text, finalize=True)
+
+
+class ParakeetTranscribeThread(threading.Thread):
+    """NVIDIA Parakeet-TDT engine via NeMo. Better English WER than Whisper large-v3
+    and often faster due to CTC-style decoder. Requires nemo_toolkit[asr] and a
+    CUDA-enabled torch. Loads model.cuda() unconditionally — GPU-only policy."""
+    daemon = True
+
+    def __init__(self, in_q: queue.Queue, ui_cb, model_name: str = "nvidia/parakeet-tdt-0.6b-v2"):
+        super().__init__()
+        self.in_q = in_q
+        self.cb = ui_cb
+        self.running = True
+        self.model_name = model_name
+
+    def run(self):
+        try:
+            import warnings
+            warnings.filterwarnings("ignore")
+            import torch
+            import nemo.collections.asr as nemo_asr
+        except Exception as e:
+            self.cb(f"Parakeet import failed: {e}. Fall back to --engine whisper.")
+            return
+
+        if not torch.cuda.is_available():
+            self.cb("CUDA torch not available — Parakeet needs GPU. Reinstall torch+cu121.")
+            return
+
+        self.cb(f"Loading {self.model_name.rsplit('/', 1)[-1]} on CUDA...")
+        try:
+            model = nemo_asr.models.ASRModel.from_pretrained(model_name=self.model_name)
+            model = model.cuda()
+            model.eval()
+            try:
+                # Long-audio path: local attention keeps VRAM low for 4 GB cards
+                model.change_attention_model("rel_pos_local_attn", [256, 256])
+            except Exception:
+                pass
+            self.cb(f"Parakeet ready. GPU-only.")
+        except Exception as e:
+            self.cb(f"Parakeet load failed: {e}")
+            print(f"[parakeet load err] {e}\n{traceback.format_exc()}")
+            return
+
+        while self.running:
+            try:
+                audio = self.in_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if audio is None or len(audio) < 1600:
+                continue
+            # Drop stale backlog
+            dropped = 0
+            while self.in_q.qsize() > MAX_QUEUE_BACKLOG:
+                try:
+                    audio = self.in_q.get_nowait()
+                    dropped += 1
+                except queue.Empty:
+                    break
+            if dropped:
+                print(f"[parakeet] dropped {dropped} stale segments")
+            try:
+                with torch.no_grad():
+                    out = model.transcribe([audio.astype("float32")], batch_size=1, verbose=False)
+                # NeMo returns either list[str] or list[Hypothesis] depending on version
+                if out and isinstance(out, (list, tuple)):
+                    first = out[0]
+                    if isinstance(first, (list, tuple)) and first:
+                        first = first[0]
+                    text = getattr(first, "text", None) or (first if isinstance(first, str) else "")
+                else:
+                    text = ""
+                text = (text or "").strip()
+            except Exception as e:
+                err = str(e).lower()
+                print(f"[parakeet err] {e}")
+                if "out of memory" in err or "cuda" in err:
+                    try:
+                        import gc
+                        torch.cuda.empty_cache()
+                        gc.collect()
+                        self.cb("CUDA OOM — retrying...")
+                    except Exception:
+                        pass
+                else:
+                    self.cb(f"[parakeet err: {e}]")
+                continue
+            if text and not _is_likely_hallucination(text):
+                self.cb(text, finalize=True)
+
+
 class TranscribeThread(threading.Thread):
     daemon = True
 
@@ -406,13 +624,16 @@ class TranscribeThread(threading.Thread):
                     language="en",
                     beam_size=1,
                     best_of=1,
-                    vad_filter=False,
+                    # Silero VAD trims silence/noise at audio level before decode.
+                    # Kills hallucinations on quiet patches, shortens decode work,
+                    # wins on both quality and latency.
+                    vad_filter=True,
+                    vad_parameters={"min_silence_duration_ms": 200, "threshold": 0.4},
                     condition_on_previous_text=False,
                     without_timestamps=True,
-                    no_speech_threshold=0.6,
-                    # skip sanity filters that cost extra decoder passes
-                    log_prob_threshold=None,
-                    compression_ratio_threshold=None,
+                    no_speech_threshold=0.7,
+                    compression_ratio_threshold=2.2,
+                    log_prob_threshold=-1.0,
                 )
                 text = " ".join(s.text.strip() for s in segments).strip()
             except Exception as e:
@@ -439,6 +660,10 @@ class TranscribeThread(threading.Thread):
                         self.cb(f"GPU reload failed: {e2}. Kill other CUDA apps and relaunch.")
                 else:
                     self.cb(f"[transcribe err: {e}]")
+                continue
+            # Filter known Whisper hallucination phrases — these appear when
+            # audio is silent / ambiguous and the model falls back to its training bias.
+            if text and _is_likely_hallucination(text):
                 continue
             if text:
                 self.cb(text, finalize=True)
@@ -595,6 +820,10 @@ def main():
                     help="overlay position (default bottom, YouTube-style)")
     ap.add_argument("--streaming", action="store_true",
                     help="rolling-window live mode: emit captions every 0.6s with updates mid-sentence")
+    ap.add_argument("--engine", choices=["whisper", "parakeet", "sensevoice"], default="whisper",
+                    help="ASR engine. whisper = faster-whisper (default). parakeet = NVIDIA Parakeet-TDT-0.6B "
+                         "(OOMs on 1050 Ti). sensevoice = Alibaba SenseVoice-Small, non-autoregressive, "
+                         "WER ~7.5%%, non-Whisper architecture, needs funasr package.")
     args = ap.parse_args()
 
     audio_q: queue.Queue = queue.Queue()
@@ -618,7 +847,14 @@ def main():
     # Streaming mode replaces the VAD silence-flush with a rolling window emitter.
     use_streaming = args.streaming
     vad = VADThread(audio_q, segment_q)
-    transcribe = TranscribeThread(segment_q, ui.set_text, args.model, args.cpu, args.compute_type)
+    if args.engine == "parakeet":
+        pk_model = args.model if "/" in args.model else "nvidia/parakeet-tdt-0.6b-v2"
+        transcribe = ParakeetTranscribeThread(segment_q, ui.set_text, pk_model)
+    elif args.engine == "sensevoice":
+        sv_model = args.model if "/" in args.model else "iic/SenseVoiceSmall"
+        transcribe = SenseVoiceTranscribeThread(segment_q, ui.set_text, sv_model)
+    else:
+        transcribe = TranscribeThread(segment_q, ui.set_text, args.model, args.cpu, args.compute_type)
 
     def stop():
         for c in captures:
@@ -661,7 +897,12 @@ def main():
                 vad = new_vad
             if transcribe.running and not transcribe.is_alive():
                 print("[supervisor] transcribe died, respawning")
-                new_t = TranscribeThread(segment_q, ui.set_text, args.model, args.cpu, args.compute_type)
+                if args.engine == "parakeet":
+                    new_t = ParakeetTranscribeThread(segment_q, ui.set_text, args.model if "/" in args.model else "nvidia/parakeet-tdt-0.6b-v2")
+                elif args.engine == "sensevoice":
+                    new_t = SenseVoiceTranscribeThread(segment_q, ui.set_text, args.model if "/" in args.model else "iic/SenseVoiceSmall")
+                else:
+                    new_t = TranscribeThread(segment_q, ui.set_text, args.model, args.cpu, args.compute_type)
                 new_t.start()
                 transcribe = new_t
     sup_thread = threading.Thread(target=supervisor, daemon=True)

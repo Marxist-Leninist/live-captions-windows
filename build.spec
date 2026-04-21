@@ -43,6 +43,10 @@ a = Analysis(
         "torch", "torchvision", "torchaudio",
         "sympy", "networkx",  # torch-only deps
         "sentencepiece",  # not used for .en models
+        # NeMo (for Parakeet path) pulls transformers + pytorch-lightning — we don't
+        # use them in the Whisper build path. Excluding avoids a broken PyInstaller hook.
+        "transformers", "datasets", "pytorch_lightning", "lightning",
+        "nemo", "nemo_toolkit",
         # NOTE: do NOT exclude filelock or jinja2 — huggingface_hub needs them
         # for download locking when a new model is fetched.
     ],
